@@ -5,6 +5,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
+	"sync"
+	"time"
 
 	gocoap "github.com/dustin/go-coap"
 )
@@ -12,14 +15,24 @@ import (
 var (
 	ProxyConn  *net.UDPConn
 	ServerAddr *net.UDPAddr
-	ClientDict map[string]*Connection = make(map[string]*Connection)
-	conn       *Connection
-	msgChan    = make(chan *net.UDPAddr, 1)
+	ClientDict = make(map[string]*Connection)
+	dmutex     sync.Mutex
 )
 
 type Connection struct {
 	ClientAddr *net.UDPAddr
 	ServerConn *net.UDPConn
+}
+
+func NewConnection(srvAddr, cliAddr *net.UDPAddr) *Connection {
+	conn := new(Connection)
+	conn.ClientAddr = cliAddr
+	srvudp, err := net.DialUDP("udp", nil, srvAddr)
+	if err != nil {
+		slog.Error("Failed to dial server", slog.Any("err", err))
+	}
+	conn.ServerConn = srvudp
+	return conn
 }
 
 func setup(hostport string, port int) bool {
@@ -40,33 +53,26 @@ func setup(hostport string, port int) bool {
 	}
 
 	ServerAddr = srvaddr
-	serverConnection, err := net.DialUDP("udp", nil, srvaddr)
-	if err != nil {
-		slog.Error("Failed to listen on UDP", slog.Any("err", err))
-	}
-	conn = &Connection{
-		ServerConn: serverConnection,
-	}
 	slog.Info("Server address", slog.Any("addr", srvaddr.String()))
 	return true
 }
 
-func Down() {
+func Down(conn *Connection) {
 	var buffer [1500]byte
-	select {
-	case msg := <-msgChan:
-		for {
-			n, err := conn.ServerConn.Read(buffer[0:])
-			if err != nil {
-				slog.Error("Failed to read from server", slog.Any("err", err))
-			}
-
-			_, err = ProxyConn.WriteToUDP(buffer[0:n], msg)
-			if err != nil {
-				slog.Error("Failed to write to client", slog.Any("err", err))
-			}
+	for {
+		conn.ServerConn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+		n, err := conn.ServerConn.Read(buffer[0:])
+		if err != nil {
+			slog.Error("Failed to read from server", slog.Any("err", err))
+			close(conn.ServerConn, conn.ClientAddr)
+			break
 		}
 
+		_, err = ProxyConn.WriteToUDP(buffer[0:n], conn.ClientAddr)
+		if err != nil {
+			slog.Error("Failed to write to client", slog.Any("err", err))
+			break
+		}
 	}
 }
 
@@ -97,14 +103,32 @@ func Proxy() {
 			slog.Error("Failed to read from client", slog.Any("err", err))
 		}
 		saddr := cliaddr.String()
-		slog.Info("Received message from client", slog.Any("addr", saddr))
-		go Down()
-		msgChan <- cliaddr
+		dmutex.Lock()
+		conn, found := ClientDict[saddr]
+		if !found {
+			conn = NewConnection(ServerAddr, cliaddr)
+			if conn == nil {
+				dmutex.Unlock()
+				continue
+			}
+			ClientDict[saddr] = conn
+			dmutex.Unlock()
+			go Down(conn)
+		} else {
+			dmutex.Unlock()
+		}
 		Up(conn, buffer[0:n], n)
 	}
 }
 
 func main() {
+	go func() {
+		for {
+			time.Sleep(3 * time.Second)
+			fmt.Println(runtime.NumGoroutine())
+		}
+	}()
+
 	targetport := fmt.Sprintf("%s:%d", "localhost", 5683)
 	proxyport := 5682
 	if setup(targetport, proxyport) {
@@ -119,4 +143,13 @@ func handleGet() {
 
 func handlePost() {
 	slog.Info("POST request received")
+}
+
+func close(conn *net.UDPConn, cliaddr *net.UDPAddr) {
+	dmutex.Lock()
+	defer dmutex.Unlock()
+	if _, ok := ClientDict[cliaddr.String()]; ok {
+		delete(ClientDict, cliaddr.String())
+	}
+	conn.Close()
 }
